@@ -392,6 +392,16 @@ def _direct_items(base):
     return direct
 
 
+def _glut_cap(base):
+    """How much of one item is worth banking, sized to the current rung.
+
+    Enough to cover the next quest comfortably; past that a pile is just metal
+    and robot-hours the gating chain never sees."""
+    q = base.quest if base else None
+    biggest = max([int(n) for n in (q.required or {}).values()] or [200]) if q else 200
+    return max(400, 2 * biggest)
+
+
 def _quest_tree(base):
     """The items the Base asks for, plus everything they are made from."""
     tree = set(_direct_items(base))
@@ -931,6 +941,11 @@ def _sinks(snap, want, lvl, cl, me, stock):
         # actually gating the level (233 alloy banked while circuits stall).
         if outp in direct and stock.get(outp, 0) >= qneed.get(outp, 0) + 80:
             base_prio = min(base_prio, P_PROC_ANY)
+        # Same for a feeder that has run away from its consumers: 1593 wire
+        # banked against a rung that cannot use it is metal and haulage spent
+        # on nothing.  Keep a buffer sized to the rung, not an unbounded pile.
+        elif outp not in direct and stock.get(outp, 0) > _glut_cap(snap.base):
+            base_prio = min(base_prio, P_BANK)
         if b.condition is not None and b.condition <= 0:
             base_prio = 10.0          # halted: repairing it comes first
         for it, amt in ins.items():
@@ -965,8 +980,9 @@ def _sinks(snap, want, lvl, cl, me, stock):
             present.update(rc.items.keys())
     # Banking a raw the city already has mountains of just burns robot trips
     # (and lifespan), so stop pulling those once the pile is deep enough.
+    gcap = _glut_cap(snap.base)
     glut = set(it for it in present
-               if it in RAWS and stock.get(it, 0) > 300 + 200 * lvl)
+               if stock.get(it, 0) > (300 + 200 * lvl if it in RAWS else gcap))
     for b in snap.banks:
         free = b.storage.free
         if free <= 0:
