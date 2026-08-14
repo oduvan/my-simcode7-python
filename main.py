@@ -462,7 +462,7 @@ def _wishlist(snap, want, spots, lvl, stock):
             add("mining", res)
     # A bank with no room freezes robots holding undroppable cargo, which can
     # stall the whole city (gotcha #7) — so add capacity well before the cliff.
-    if sum(b.storage.free for b in snap.banks) < 800:
+    if sum(b.storage.free for b in snap.banks) < 1200:
         add("warehouse")
         add("storage")
 
@@ -502,9 +502,11 @@ def _wishlist(snap, want, spots, lvl, stock):
 
     if planned("flying_station") < min(3, 1 + len(snap.mines) // 6):
         add("flying_station")
+    # Towers save charging flights but cost wire, which is usually the very
+    # thing the quest chain is short of — so only out of genuine surplus.
     if lvl >= 4 and len(snap.pads) + planned("charging_tower") \
             < 2 + len(snap.mines) // 3:
-        add("charging_tower")
+        add("charging_tower", None, 3.0)
 
     # Breadth.  The ladder is generated from the world seed, so the next rung
     # can ask for anything — a city that already runs one of every unlocked
@@ -1119,7 +1121,9 @@ def _explore_value(snap, spots, want, lvl):
             known.add(sp.resource)
     missing = [x for x in RAWS if x in want and x not in known]
     if not missing:
-        return EX_IDLE, max(1, len(robots) // 8)
+        # Exploring costs lifespan, and lifespan is the fleet's real currency.
+        # With the map already yielding spots, one or two scouts is plenty.
+        return EX_IDLE, (1 if len(robots) < 20 else 2)
     if not snap.mines and not snap.mine_sites():
         return EX_CRITICAL, len(robots)
     return EX_URGENT, max(1, min(3, len(robots) // 2))
