@@ -514,7 +514,11 @@ def _wishlist(snap, want, spots, lvl, stock):
     def planned(t):
         return (sum(1 for b in snap.all if b.type == t and b.status != "decommissioning"))
 
-    if planned("flying_station") < min(3, 1 + len(snap.mines) // 6):
+    # A Station is also a charging pad, and at 10 ore it is by far the cheapest
+    # one (a Charging Tower costs 40 wire, which the chain always wants more).
+    # Only the two nearest the Base are ever stocked, so extras out at the
+    # frontier hoard nothing — they just stop robots flying home to charge.
+    if planned("flying_station") < min(6, 2 + len(snap.mines) // 5):
         add("flying_station")
     # Towers save charging flights but cost wire, which is usually the very
     # thing the quest chain is short of — so only out of genuine surplus.
@@ -686,15 +690,22 @@ def _plan(snap, wish, spots, lvl, tick):
     # Recycle surplus Flying Stations.  A station's store is a one-way door —
     # you cannot pick up from it — so every extra one parks raws where nothing
     # can reach them.  Tearing it down returns the build cost AND the contents.
-    cap_st = min(3, 1 + len(snap.mines) // 6)
+    cap_st = min(6, 2 + len(snap.mines) // 5)
     if len(snap.stations) > cap_st and not snap.decom:
         keep = set(b.id for b in sorted(
             snap.stations,
-            key=lambda b: _dist(b.position, snap.base.position))[:cap_st])
+            key=lambda b: _dist(b.position, snap.base.position))[:2])
         for b in snap.stations:
             if b.id in keep:
                 continue
             if b.production.active or (b.production.queued or 0):
+                continue
+            # Only scrap one that is redundant AS A PAD — another pad already
+            # covers its patch.  A lone station out on the frontier is earning
+            # its keep even with an empty store.
+            near = [p for p in snap.pads
+                    if p.id != b.id and _dist(p.position, b.position) < 10]
+            if not near:
                 continue
             b.destroy()
             return
@@ -732,6 +743,21 @@ def _plan(snap, wish, spots, lvl, tick):
             continue
         w, h = (2, 2) if t in ("storage", "warehouse") else (1, 1)
         anchor = base_pos
+        if t in ("flying_station", "charging_tower"):
+            # Put the new pad where the fleet is furthest from one: at the mine
+            # with the longest run home to charge.
+            far, fd = None, -1.0
+            for m in snap.mines:
+                _p, d = snap.near_pad(m.position)
+                if d > fd:
+                    fd, far = d, m.position
+            if far is not None and fd > 16:
+                anchor = (int(round(far[0])), int(round(far[1])))
+            pos = _site_cells(snap, w, h, anchor, t, nb, spot_cells)
+            if pos is None:
+                continue
+            world.build(t, pos[0], pos[1])
+            return
         # A T1 processor eats raws and emits fewer units than it consumes
         # (2 metal -> 1 wire), so siting it AT its mine roughly halves the
         # tonnage that has to cross the map.  T2/T3 run on goods and stay near
@@ -747,15 +773,6 @@ def _plan(snap, wish, spots, lvl, tick):
                            key=lambda m: _dist(m.position, base_pos))
                 if _dist(near.position, base_pos) > 12:
                     anchor = near.position
-        if t in ("flying_station", "charging_tower") and snap.mines:
-            far, fd = None, -1.0
-            for m in snap.mines:
-                d = _dist(m.position, base_pos)
-                if d > fd:
-                    fd, far = d, m.position
-            if fd > 28:
-                anchor = ((base_pos[0] + far[0]) / 2.0, (base_pos[1] + far[1]) / 2.0)
-                anchor = (int(round(anchor[0])), int(round(anchor[1])))
         pos = _site_cells(snap, w, h, anchor, t, nb, spot_cells)
         if pos is None:
             continue
@@ -841,16 +858,37 @@ def _sinks(snap, want, lvl, cl, me, stock):
             if need > 0:
                 out.append((P_SITE, b, it, need))
     if snap.base:
+        # Deliver against the LAGGING requirement first.  A rung often asks for
+        # an item and something built from it (600 part + 1800 plate): if plate
+        # always outranks everything, every plate goes straight to the Base,
+        # the assemblers never get fed, and `part` simply never moves.  Letting
+        # the item that is already ahead drop below processor-feeding priority
+        # sends its surplus into the chain that is behind instead.
+        q = snap.base.quest
+        req = (q.required or {}) if q else {}
+        prog = (q.progress or {}) if q else {}
+        fracs = {}
+        for it, n in req.items():
+            if int(n) > 0:
+                fracs[it] = min(1.0, int(prog.get(it, 0)) / float(int(n)))
+        behind = min(fracs.values()) if fracs else 0.0
         for it, need in _quest_need(snap.base).items():
             need -= _claimed(cl, me, snap.base.id, it, 5)
-            if need > 0:
-                out.append((P_QUEST, snap.base, it, need))
+            if need <= 0:
+                continue
+            ahead = fracs.get(it, 0.0) > behind + 0.15
+            out.append((P_QUEST - 30.0 if ahead else P_QUEST,
+                        snap.base, it, need))
     target = _fleet_target(snap, lvl)
     fleet = _fleet_now()
-    if fleet < MIN_FLEET:
+    # Robots ARE throughput, and they expire continuously — a fleet allowed to
+    # decay drags every other number down with it.  Replacement therefore has
+    # to outrank feeding a starved factory (P_STARVED), or the chain eats the
+    # raws the Station needed and the city quietly shrinks to a handful.
+    if fleet < MIN_FLEET or fleet < target * 0.5:
         p_st = P_FLEET
     elif fleet < target * 0.92:
-        p_st = P_STATION_LOW
+        p_st = P_STARVED + 1.0
     else:
         p_st = P_STATION
     gap = max(0, target - fleet)
