@@ -411,10 +411,10 @@ def _producer_cap(item, base, lvl, tree):
     number of copies with the level (the ladder grows ~1.5x per rung).  A
     feeder one tier down needs copies too, or it starves the tier above."""
     if item in _direct_items(base):
-        return min(7, 2 + lvl // 2)
+        return min(8, 2 + lvl)
     if item in tree:
-        return min(5, 1 + lvl // 2)
-    return min(2, 1 + lvl // 4)
+        return min(8, 2 + lvl)
+    return min(3, 1 + lvl // 3)
 
 
 def _wishlist(snap, want, spots, lvl):
@@ -433,9 +433,11 @@ def _wishlist(snap, want, spots, lvl):
     chain_ok = ((not raw_only) or _quest_frac(snap.base) >= 0.6) \
         and len(robots) >= MIN_FLEET
 
-    def add(t, res=None):
+    def add(t, res=None, mult=1.0):
+        """mult = how many times the cost must be in stock before placing it,
+        so speculative breadth never eats materials the quest needs."""
         if t in unl:
-            wish.append((t, res))
+            wish.append((t, res, mult))
 
     if have_mine.get("ore", 0) < 1:
         add("mining", "ore")
@@ -477,6 +479,21 @@ def _wishlist(snap, want, spots, lvl):
         add("flying_station")
     if lvl >= 4 and len(snap.pads) < 2 + len(snap.mines) // 3:
         add("charging_tower")
+
+    # Breadth.  The ladder is generated from the world seed, so the next rung
+    # can ask for anything — a city that already runs one of every unlocked
+    # processor starts each new quest with stock instead of a build queue.
+    if chain_ok:
+        for item in sorted(CHAIN, key=lambda i: TIER.get(i, 9)):
+            ptype, inputs = CHAIN[item]
+            if any(b.type == ptype for b in snap.procs + snap.sites):
+                continue
+            short = [s for s in inputs
+                     if s in RAWS and have_mine.get(s, 0) < 1]
+            for s in short:
+                add("mining", s, 2.0)
+            if not short:
+                add(ptype, None, 2.5)
     return wish
 
 
@@ -500,9 +517,8 @@ def _reserve(snap):
     return dict((k, v) for k, v in res.items() if k in RAWS)
 
 
-def _spendable(snap, reserve):
+def _spendable(stock, reserve):
     """How much of each ring-fenced raw ordinary traffic may still move."""
-    stock = snap.stock()
     return dict((it, stock.get(it, 0) - n) for it, n in reserve.items())
 
 
@@ -574,7 +590,7 @@ def _unblock(snap, stock):
             left = int(n) - int(dlv.get(it, 0))
             if left > 0:
                 short[it] = short.get(it, 0) + left
-    if not any(m.spot for m in snap.mines):
+    if not snap.mines and not snap.mine_sites():
         for it, n in _cost_of("mining").items():
             short[it] = max(short.get(it, 0), int(n))
     if not short:
@@ -622,11 +638,11 @@ def _plan(snap, wish, spots, lvl, tick):
     base_pos = snap.base.position if snap.base else (0, 0)
 
     spot_cells = set(s[0] for s in spots)
-    for t, res in wish:
+    for t, res, mult in wish:
         if nb.get(t) == "level_required":
             continue
         cost = _cost_of(t)
-        if any(stock.get(it, 0) < int(n) for it, n in cost.items()):
+        if any(stock.get(it, 0) < int(n) * mult for it, n in cost.items()):
             continue
         if t in MINE_TYPES:
             cand = [s for s in spots if s[1] == res]
@@ -703,7 +719,7 @@ def _produce(snap, lvl, tick):
 # ---------------------------------------------------------------------------
 # sinks & sources
 # ---------------------------------------------------------------------------
-def _sinks(snap, want, lvl, cl, me):
+def _sinks(snap, want, lvl, cl, me, stock):
     """[(priority, building, item, need)] — everything that wants something."""
     out = []
     for b in snap.sites:
@@ -741,6 +757,7 @@ def _sinks(snap, want, lvl, cl, me):
             if need > 0:
                 out.append((p_st, st, it, need))
     direct = _direct_items(snap.base) if snap.base else set()
+    tree = _quest_tree(snap.base) if snap.base else set()
     for b in snap.procs:
         rec = b.recipe
         inp = b.input
@@ -749,10 +766,16 @@ def _sinks(snap, want, lvl, cl, me):
         ins = rec.inputs or {}
         tot = sum(int(v) for v in ins.values()) or 1
         outp = PRODUCER.get(b.type)
-        base_prio = P_PROC_WANT if outp in want else P_PROC_ANY
+        in_tree = outp in tree
+        base_prio = P_PROC_WANT if in_tree else P_PROC_ANY
         if b.condition is not None and b.condition <= 0:
             base_prio = 10.0          # halted: repairing it comes first
         for it, amt in ins.items():
+            # Never let a factory nobody is waiting on eat a scarce input that
+            # the quest chain needs (circuits swallowing the wire that `part`
+            # was waiting for is how a level silently stops progressing).
+            if not in_tree and it in tree and stock.get(it, 0) < 150:
+                continue
             share = int(inp.capacity * (int(amt) / tot) * 0.9)
             need = min(share - inp[it], inp.free)
             need -= _claimed(cl, me, b.id, it, 5)
@@ -777,39 +800,52 @@ def _sinks(snap, want, lvl, cl, me):
         rc = b.recoverable
         if rc:
             present.update(rc.items.keys())
+    # Banking a raw the city already has mountains of just burns robot trips
+    # (and lifespan), so stop pulling those once the pile is deep enough.
+    glut = set(it for it in present
+               if it in RAWS and stock.get(it, 0) > 300 + 200 * lvl)
     for b in snap.banks:
         free = b.storage.free
         if free <= 0:
             continue
         out.append((P_BANK, b, None, free))
         for it in present:
-            out.append((P_BANK, b, it, free))
+            if it not in glut:
+                out.append((P_BANK, b, it, free))
     return out
 
 
 def _sources(snap):
-    """[(building, store, urgency_bonus)] — everything holding goods."""
-    out = []
+    """item -> [(building, available, urgency_bonus)] for everything in stock.
+
+    Indexed by item so a haul search only walks the buildings that actually
+    hold what a sink is asking for."""
+    raw = []
     for b in snap.mines:
         sto = b.storage
         if sto.total <= 0:
             continue
         full = sto.capacity and sto.total >= 0.55 * sto.capacity
-        out.append((b, sto, 22.0 if full else 6.0))
+        raw.append((b, sto, 22.0 if full else 6.0))
     for b in snap.procs:
         o = b.output
         if o is None or o.total <= 0:
             continue
         full = o.capacity and o.total >= 0.6 * o.capacity
-        out.append((b, o, 26.0 if full else 8.0))
+        raw.append((b, o, 26.0 if full else 8.0))
     for b in snap.decom:
         rc = b.recoverable
         if rc is not None and rc.total > 0:
-            out.append((b, rc, 30.0))
+            raw.append((b, rc, 30.0))
     for b in snap.banks:
         if b.storage.total > 0:
-            out.append((b, b.storage, 0.0))
-    return out
+            raw.append((b, b.storage, 0.0))
+    by_item = {}
+    for b, sto, bonus in raw:
+        for it, n in sto.items.items():
+            if n > 0:
+                by_item.setdefault(it, []).append((b, n, bonus))
+    return by_item
 
 
 # ---------------------------------------------------------------------------
@@ -889,11 +925,14 @@ def _best_fetch(r, snap, sinks, sources, spendable, cl):
             room = spendable[item]
             if room <= 0:
                 continue
-        for src, sto, bonus in sources:
+        cands = sources.get(item)
+        if not cands:
+            continue
+        if len(cands) > 8:
+            cands = sorted(cands,
+                           key=lambda c: _dist(r.position, c[0].position))[:8]
+        for src, avail, bonus in cands:
             if src.id == sink.id:
-                continue
-            avail = sto[item]
-            if avail <= 0:
                 continue
             if src.type in BANK_TYPES and sink.type in BANK_TYPES:
                 continue
@@ -1057,7 +1096,8 @@ def _act(e):
     _status(r, snap, lvl, tick)
 
     cl = _claims(tick)
-    spendable = _spendable(snap, _reserve(snap))
+    stock = snap.stock()
+    spendable = _spendable(stock, _reserve(snap))
     inv = r.inventory
 
     # 1. never die mid-flight
@@ -1072,7 +1112,7 @@ def _act(e):
     if r.type == "mechanic" and _mechanic_job(r, snap):
         return
 
-    sinks = _sinks(snap, want, lvl, cl, rid)
+    sinks = _sinks(snap, want, lvl, cl, rid, stock)
 
     # 2. top up where we stand, then deliver what we hold
     if inv.total > 0:
