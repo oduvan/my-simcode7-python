@@ -454,17 +454,16 @@ def _wishlist(snap, want, spots, lvl, stock):
             add("mining", res)
 
     tree = _quest_tree(snap.base)
-    # Demand-driven extraction: a fixed per-raw target cannot know that THIS
-    # rung burns metal four times faster than ore.  If a raw the quest chain
-    # consumes is running thin, dig more of it, whatever the nominal target.
-    for res in RAWS:
-        if res in tree and stock.get(res, 0) < 250 and have_mine.get(res, 0) < 8:
-            add("mining", res)
-    # A bank with no room freezes robots holding undroppable cargo, which can
-    # stall the whole city (gotcha #7) — so add capacity well before the cliff.
-    if sum(b.storage.free for b in snap.banks) < 1200:
+    bank_free = sum(b.storage.free for b in snap.banks)
+    # Only the genuine emergencies come before the chain: a bank about to jam
+    # (a full store freezes robots holding undroppable cargo, gotcha #7) and a
+    # raw that has actually run out.
+    if bank_free < 400:
         add("warehouse")
         add("storage")
+    for res in RAWS:
+        if res in tree and stock.get(res, 0) < 60 and have_mine.get(res, 0) < 8:
+            add("mining", res)
 
     if chain_ok:
         need = _quest_need(snap.base)
@@ -490,6 +489,16 @@ def _wishlist(snap, want, spots, lvl, stock):
                 # itself instead of losing the race to a 15-ore mine.
                 add(ptype, None, 0.25 if item in tree else 1.0)
 
+    # Comfort measures rank BELOW the chain.  They are cheap, and the planner
+    # places the first affordable wish it finds, so anything cheap listed above
+    # a factory wins the build slot every single pass and the quest stalls
+    # while the city digs its ninth mine.
+    for res in RAWS:
+        if res in tree and stock.get(res, 0) < 250 and have_mine.get(res, 0) < 8:
+            add("mining", res)
+    if bank_free < 1200:
+        add("warehouse")
+        add("storage")
     for res in RAWS:
         if have_mine.get(res, 0) < _target_mines(res, lvl, want):
             add("mining", res)
