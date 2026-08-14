@@ -461,6 +461,11 @@ def _wishlist(snap, want, spots, lvl, stock):
     if bank_free < 400:
         add("warehouse")
         add("storage")
+    # A single bank is a single point of failure: when it fills there is no
+    # drop target left, and robots holding undroppable cargo never re-enter
+    # task selection (gotcha #7).  A spare Storage is 8 ore — buy the insurance.
+    if lvl >= 3 and len(snap.banks) < 2:
+        add("storage")
     for res in RAWS:
         if res in tree and stock.get(res, 0) < 60 and have_mine.get(res, 0) < 8:
             add("mining", res)
@@ -568,7 +573,7 @@ def _site_cells(snap, w, h, near, btype, nb, taken):
     Refused cells matter: without skipping them the search is deterministic, so
     one `cell_occupied` would make that building type unbuildable forever."""
     ring = []
-    for rad in range(1, 16):
+    for rad in range(1, 22):
         for dx in range(-rad, rad + 1):
             for dy in range(-rad, rad + 1):
                 if max(abs(dx), abs(dy)) != rad:
