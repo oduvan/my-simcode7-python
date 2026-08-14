@@ -469,7 +469,7 @@ def _wishlist(snap, want, spots, lvl, stock):
     if lvl >= 3 and len(snap.banks) < 2:
         add("storage")
     for res in RAWS:
-        if res in tree and stock.get(res, 0) < 60 and have_mine.get(res, 0) < 12:
+        if res in tree and stock.get(res, 0) < 100 and have_mine.get(res, 0) < 12:
             add("mining", res)
 
     if chain_ok:
