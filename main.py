@@ -417,7 +417,7 @@ def _producer_cap(item, base, lvl, tree):
     return min(3, 1 + lvl // 3)
 
 
-def _wishlist(snap, want, spots, lvl):
+def _wishlist(snap, want, spots, lvl, stock):
     """Ordered list of (building_type, resource_or_None) we would like next."""
     unl = set(base_unlocks(snap))
     wish = []
@@ -443,16 +443,26 @@ def _wishlist(snap, want, spots, lvl):
         add("mining", "ore")
     if have_mine.get("metal", 0) < 1:
         add("mining", "metal")
-    if not snap.stations and not any(b.type == "flying_station" for b in snap.sites):
+    if not any(b.type == "flying_station" for b in snap.all):
         add("flying_station")
     for res in ("ore", "metal"):
         if have_mine.get(res, 0) < 2 and _target_mines(res, lvl, want) >= 2:
             add("mining", res)
 
+    tree = _quest_tree(snap.base)
+    # Demand-driven extraction: a fixed per-raw target cannot know that THIS
+    # rung burns metal four times faster than ore.  If a raw the quest chain
+    # consumes is running thin, dig more of it, whatever the nominal target.
+    for res in RAWS:
+        if res in tree and stock.get(res, 0) < 100 and have_mine.get(res, 0) < 6:
+            add("mining", res)
+
     if chain_ok:
-        tree = _quest_tree(snap.base)
+        need = _quest_need(snap.base)
+        # Build the chain the Base is waiting on hardest first, cheapest tier
+        # up, so 100 coke is not queued behind a processor nobody needs yet.
         by_tier = sorted((x for x in want if x in CHAIN),
-                         key=lambda i: TIER.get(i, 9))
+                         key=lambda i: (TIER.get(i, 9), -need.get(i, 0)))
         for item in by_tier:
             ptype, inputs = CHAIN[item]
             n = sum(1 for b in snap.procs if b.type == ptype)
@@ -465,7 +475,11 @@ def _wishlist(snap, want, spots, lvl):
                     add("mining", src)
                     blocked = True
             if not blocked:
-                add(ptype)
+                # A factory for what the Base is waiting on may be placed
+                # part-funded: its inputs are exactly the goods nothing else
+                # consumes, and a site outranks every other sink, so it fills
+                # itself instead of losing the race to a 15-ore mine.
+                add(ptype, None, 0.25 if item in tree else 1.0)
 
     for res in RAWS:
         if have_mine.get(res, 0) < _target_mines(res, lvl, want):
@@ -475,9 +489,16 @@ def _wishlist(snap, want, spots, lvl):
     if free < 500:
         add("warehouse")
         add("storage")
-    if len(snap.stations) < min(4, 1 + len(snap.mines) // 4):
+    # Count sites too: a type whose site is already in flight is NOT missing.
+    # Without this the planner re-queues it every pass while it builds, and a
+    # cheap building (a Station is 10 ore) wins the build slot every time.
+    def planned(t):
+        return (sum(1 for b in snap.all if b.type == t and b.status != "decommissioning"))
+
+    if planned("flying_station") < min(3, 1 + len(snap.mines) // 6):
         add("flying_station")
-    if lvl >= 4 and len(snap.pads) < 2 + len(snap.mines) // 3:
+    if lvl >= 4 and len(snap.pads) + planned("charging_tower") \
+            < 2 + len(snap.mines) // 3:
         add("charging_tower")
 
     # Breadth.  The ladder is generated from the world seed, so the next rung
@@ -633,6 +654,9 @@ def _plan(snap, wish, spots, lvl, tick):
         return
     if not wish:
         return
+    # A part-funded factory site outbids every other sink, so keep at most two
+    # in flight or they starve the very chain they are meant to widen.
+    busy_proc = sum(1 for b in snap.sites if b.type in PRODUCER)
     stock = snap.stock()
     nb = _sget("nb", {})
     base_pos = snap.base.position if snap.base else (0, 0)
@@ -641,6 +665,8 @@ def _plan(snap, wish, spots, lvl, tick):
     for t, res, mult in wish:
         if nb.get(t) == "level_required":
             continue
+        if t in PRODUCER and busy_proc >= 2:
+            continue
         cost = _cost_of(t)
         if any(stock.get(it, 0) < int(n) * mult for it, n in cost.items()):
             continue
@@ -648,7 +674,7 @@ def _plan(snap, wish, spots, lvl, tick):
             cand = [s for s in spots if s[1] == res]
             if not cand:
                 continue
-            cand.sort(key=lambda s: _dist(s[0], base_pos) - 0.015 * s[2])
+            cand.sort(key=lambda s: _dist(s[0], base_pos) - 0.008 * s[2])
             for pos, _r, _rem in cand[:5]:
                 if nb.get(_nb_key(t, pos)):
                     continue
@@ -1090,13 +1116,13 @@ def _act(e):
     lvl = snap.base.level or 1
     want = _want(snap.base, snap)
     spots = _live_spots(snap)
-    wish = _wishlist(snap, want, spots, lvl)
+    stock = snap.stock()
+    wish = _wishlist(snap, want, spots, lvl, stock)
     _plan(snap, wish, spots, lvl, tick)
     _produce(snap, lvl, tick)
     _status(r, snap, lvl, tick)
 
     cl = _claims(tick)
-    stock = snap.stock()
     spendable = _spendable(stock, _reserve(snap))
     inv = r.inventory
 
