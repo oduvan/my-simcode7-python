@@ -146,9 +146,6 @@ def _reset_if_stale():
 class Snap:
     """One categorised pass over the buildings for this dispatch."""
 
-    __slots__ = ("base", "sites", "mines", "banks", "stations", "procs",
-                 "decom", "pads", "occupied", "all")
-
     def __init__(self):
         self.base = None
         self.sites = []
