@@ -667,6 +667,22 @@ def _plan(snap, wish, spots, lvl, tick):
     if _unblock(snap, stock0):
         return
 
+    # Recycle surplus Flying Stations.  A station's store is a one-way door —
+    # you cannot pick up from it — so every extra one parks raws where nothing
+    # can reach them.  Tearing it down returns the build cost AND the contents.
+    cap_st = min(3, 1 + len(snap.mines) // 6)
+    if len(snap.stations) > cap_st and not snap.decom:
+        keep = set(b.id for b in sorted(
+            snap.stations,
+            key=lambda b: _dist(b.position, snap.base.position))[:cap_st])
+        for b in snap.stations:
+            if b.id in keep:
+                continue
+            if b.production.active or (b.production.queued or 0):
+                continue
+            b.destroy()
+            return
+
     if len(snap.sites) >= 1 + min(3, len(robots) // 4):
         return
     if not wish:
