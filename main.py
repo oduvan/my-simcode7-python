@@ -875,6 +875,7 @@ def _sinks(snap, want, lvl, cl, me, stock):
                 out.append((p_st, st, it, need))
     direct = _direct_items(snap.base) if snap.base else set()
     tree = _quest_tree(snap.base) if snap.base else set()
+    qneed = _quest_need(snap.base) if snap.base else {}
     for b in snap.procs:
         rec = b.recipe
         inp = b.input
@@ -885,6 +886,11 @@ def _sinks(snap, want, lvl, cl, me, stock):
         outp = PRODUCER.get(b.type)
         in_tree = outp in tree
         base_prio = P_PROC_WANT if in_tree else P_PROC_ANY
+        # A quest item we already have far more of than the rung asks for does
+        # not need more feeding — those trips belong to whichever item is
+        # actually gating the level (233 alloy banked while circuits stall).
+        if outp in direct and stock.get(outp, 0) >= qneed.get(outp, 0) + 80:
+            base_prio = min(base_prio, P_PROC_ANY)
         if b.condition is not None and b.condition <= 0:
             base_prio = 10.0          # halted: repairing it comes first
         for it, amt in ins.items():
