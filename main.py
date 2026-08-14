@@ -92,7 +92,7 @@ EX_CRITICAL = 130.0    # no mine at all yet — finding a spot is existential
 EX_URGENT = 78.0       # a raw we need has no known live spot
 EX_IDLE = 20.0         # nothing better to do
 MARGIN = 12.0          # energy kept spare on every flight
-MAX_FLEET = 44
+MAX_FLEET = 56
 MIN_FLEET = 7          # below this, growing the fleet beats building anything
 CLAIM_TTL = 90
 
@@ -333,17 +333,26 @@ def _learn_costs(snap):
         _sput("cost", learned)
 
 
-def _live_spots(snap):
-    """Discovered, undepleted resource spots with nothing built on them."""
-    out = []
-    for c in world.spots():
-        sp = c.spot
-        if not sp or (sp.remaining or 0) <= 0:
-            continue
-        if c.position in snap.occupied:
-            continue
-        out.append((c.position, sp.resource, sp.remaining or 0))
-    return out
+_SPOTS = [-10 ** 9, []]        # [tick sampled, [(pos, resource, remaining)]]
+
+
+def _live_spots(snap, tick):
+    """Discovered, undepleted resource spots with nothing built on them.
+
+    `world.spots()` walks every revealed tile, and the revealed map grows
+    without bound — at 7k cells and a dozen idle events per tick that scan
+    dominates the whole controller.  Deposits change slowly, so sample it
+    occasionally and re-apply the (cheap) occupancy filter every call."""
+    if tick - _SPOTS[0] >= 12 or not _SPOTS[1]:
+        raw = []
+        for c in world.spots():
+            sp = c.spot
+            if not sp or (sp.remaining or 0) <= 0:
+                continue
+            raw.append((c.position, sp.resource, sp.remaining or 0))
+        _SPOTS[0] = tick
+        _SPOTS[1] = raw
+    return [s for s in _SPOTS[1] if s[0] not in snap.occupied]
 
 
 def base_unlocks(snap):
@@ -377,7 +386,7 @@ def _target_mines(res, lvl, want):
         base_n = 1
     # Rung N wants ~1.5x rung N-1, and spots are finite, so extraction has to
     # keep widening or the whole chain thins out from the bottom.
-    return min(10, base_n + max(0, (lvl - 1) // 2))
+    return min(14, base_n + max(0, (lvl - 1) // 2))
 
 
 def _direct_items(base):
@@ -430,7 +439,7 @@ def _producer_cap(item, base, lvl, tree):
         return min(3, 1 + lvl // 3)
     users = sum(1 for x in tree
                 if item in (CHAIN.get(x) or (None, ()))[1])
-    return max(2, min(12, 2 + lvl + 2 * users))
+    return max(2, min(18, 2 + lvl + 2 * users))
 
 
 def _wishlist(snap, want, spots, lvl, stock):
@@ -519,6 +528,14 @@ def _wishlist(snap, want, spots, lvl, stock):
     for res in RAWS:
         if have_mine.get(res, 0) < _target_mines(res, lvl, want):
             add("mining", res)
+    # A deep mine extracts faster into a bigger buffer, so it is strictly more
+    # raw per spot and per robot trip — the single best answer to a ladder that
+    # wants ~1.5x more every rung.  It is paid for in T2 goods, so only build
+    # one out of real surplus.
+    if "deep_mine" in unl:
+        for res in RAWS:
+            if res in tree and have_mine.get(res, 0) < _target_mines(res, lvl, want) + 3:
+                add("deep_mine", res, 2.0)
 
     # Count sites too: a type whose site is already in flight is NOT missing.
     # Without this the planner re-queues it every pass while it builds, and a
@@ -1276,7 +1293,7 @@ def _act(e):
     tick = world.tick or 0
     lvl = snap.base.level or 1
     want = _want(snap.base, snap)
-    spots = _live_spots(snap)
+    spots = _live_spots(snap, tick)
     stock = snap.stock()
     wish = _wishlist(snap, want, spots, lvl, stock)
     _plan(snap, wish, spots, lvl, tick)
