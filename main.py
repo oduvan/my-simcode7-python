@@ -375,7 +375,9 @@ def _target_mines(res, lvl, want):
         base_n = 2
     else:
         base_n = 1
-    return min(6, base_n + max(0, (lvl - 1) // 3))
+    # Rung N wants ~1.5x rung N-1, and spots are finite, so extraction has to
+    # keep widening or the whole chain thins out from the bottom.
+    return min(10, base_n + max(0, (lvl - 1) // 2))
 
 
 def _direct_items(base):
@@ -467,7 +469,7 @@ def _wishlist(snap, want, spots, lvl, stock):
     if lvl >= 3 and len(snap.banks) < 2:
         add("storage")
     for res in RAWS:
-        if res in tree and stock.get(res, 0) < 60 and have_mine.get(res, 0) < 8:
+        if res in tree and stock.get(res, 0) < 60 and have_mine.get(res, 0) < 12:
             add("mining", res)
 
     if chain_ok:
@@ -499,7 +501,7 @@ def _wishlist(snap, want, spots, lvl, stock):
     # a factory wins the build slot every single pass and the quest stalls
     # while the city digs its ninth mine.
     for res in RAWS:
-        if res in tree and stock.get(res, 0) < 250 and have_mine.get(res, 0) < 8:
+        if res in tree and stock.get(res, 0) < 250 and have_mine.get(res, 0) < 12:
             add("mining", res)
     if bank_free < 1200:
         add("warehouse")
