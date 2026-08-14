@@ -92,7 +92,7 @@ EX_CRITICAL = 130.0    # no mine at all yet — finding a spot is existential
 EX_URGENT = 78.0       # a raw we need has no known live spot
 EX_IDLE = 20.0         # nothing better to do
 MARGIN = 12.0          # energy kept spare on every flight
-MAX_FLEET = 32
+MAX_FLEET = 44
 MIN_FLEET = 7          # below this, growing the fleet beats building anything
 CLAIM_TTL = 90
 
@@ -407,14 +407,18 @@ def _quest_tree(base):
 
 
 def _producer_cap(item, base, lvl, tree):
-    """Factories are the throughput ceiling on product quests, so scale the
-    number of copies with the level (the ladder grows ~1.5x per rung).  A
-    feeder one tier down needs copies too, or it starves the tier above."""
-    if item in _direct_items(base):
-        return min(8, 2 + lvl)
-    if item in tree:
-        return min(8, 2 + lvl)
-    return min(3, 1 + lvl // 3)
+    """Factories are the throughput ceiling on product quests, so scale copies
+    with the level (the ladder grows ~1.5x per rung).
+
+    Copies also absorb wear: T2/T3 processors decay to a halt, and a world
+    whose ladder never unlocks `mechanic` has no repair at all — width is the
+    only way to keep output up.  An item feeding two branches (wire goes to
+    both `part` and `circuit`) needs proportionally more."""
+    if item not in tree and item not in _direct_items(base):
+        return min(3, 1 + lvl // 3)
+    users = sum(1 for x in tree
+                if item in (CHAIN.get(x) or (None, ()))[1])
+    return max(2, min(12, 2 + lvl + 2 * users))
 
 
 def _wishlist(snap, want, spots, lvl, stock):
@@ -454,8 +458,13 @@ def _wishlist(snap, want, spots, lvl, stock):
     # rung burns metal four times faster than ore.  If a raw the quest chain
     # consumes is running thin, dig more of it, whatever the nominal target.
     for res in RAWS:
-        if res in tree and stock.get(res, 0) < 100 and have_mine.get(res, 0) < 6:
+        if res in tree and stock.get(res, 0) < 250 and have_mine.get(res, 0) < 8:
             add("mining", res)
+    # A bank with no room freezes robots holding undroppable cargo, which can
+    # stall the whole city (gotcha #7) — so add capacity well before the cliff.
+    if sum(b.storage.free for b in snap.banks) < 800:
+        add("warehouse")
+        add("storage")
 
     if chain_ok:
         need = _quest_need(snap.base)
@@ -485,10 +494,6 @@ def _wishlist(snap, want, spots, lvl, stock):
         if have_mine.get(res, 0) < _target_mines(res, lvl, want):
             add("mining", res)
 
-    free = sum(b.storage.free for b in snap.banks)
-    if free < 500:
-        add("warehouse")
-        add("storage")
     # Count sites too: a type whose site is already in flight is NOT missing.
     # Without this the planner re-queues it every pass while it builds, and a
     # cheap building (a Station is 10 ore) wins the build slot every time.
@@ -646,6 +651,18 @@ def _plan(snap, wish, spots, lvl, tick):
             b.destroy()
             return
 
+    # A halted T2/T3 processor with nobody able to repair it is dead weight
+    # blocking a cell.  Recycle it: the build cost comes back and the planner
+    # puts up a fresh one at full condition.
+    can_repair = ("mechanic" in base_unlocks(snap)
+                  or any(r.type == "mechanic" for r in robots.all()))
+    if not can_repair:
+        for b in snap.procs:
+            if b.condition is not None and b.condition <= 0 \
+                    and (b.output is None or b.output.total == 0):
+                b.destroy()
+                return
+
     stock0 = snap.stock()
     if _unblock(snap, stock0):
         return
@@ -706,6 +723,22 @@ def _fleet_target(snap, lvl):
     return max(5, min(MAX_FLEET, 5 + 2 * len(snap.mines) + len(snap.procs)))
 
 
+def _fleet_now():
+    """Headcount discounting robots about to age out.
+
+    Every robot expires on cumulative flight distance, so counting live bodies
+    alone makes replacement a sawtooth: the fleet coasts down until it trips a
+    threshold, and throughput sags the whole way."""
+    n = 0
+    for r in robots.all():
+        lm = r.life_max or 0
+        lr = r.life_remaining
+        if lm and lr is not None and lr < 0.15 * lm:
+            continue
+        n += 1
+    return n
+
+
 def _pick_robot_type(snap, unl):
     have = {}
     for r in robots.all():
@@ -727,11 +760,16 @@ def _produce(snap, lvl, tick):
     if not snap.stations or tick - _sget("prt", -999) < 8:
         return
     _sput("prt", tick)
-    if len(robots) >= _fleet_target(snap, lvl):
-        return
     if not snap.mines:
         return          # no raw income yet — do not burn the seed capital
-    want_type = _pick_robot_type(snap, set(base_unlocks(snap)))
+    unl = set(base_unlocks(snap))
+    want_type = _pick_robot_type(snap, unl)
+    # A missing mechanic is worth a slot even at full headcount: without one a
+    # worn T2/T3 processor slows, then halts, and the chain dies with it.
+    if len(robots) >= _fleet_target(snap, lvl) + 8:
+        return          # hard headcount ceiling, whatever the age mix says
+    if _fleet_now() >= _fleet_target(snap, lvl) and want_type != "mechanic":
+        return
     cost = ROBOT_COST.get(want_type, {"ore": 12, "metal": 6})
     for st in snap.stations:
         if st.production.active or (st.production.queued or 0):
@@ -761,14 +799,20 @@ def _sinks(snap, want, lvl, cl, me, stock):
             if need > 0:
                 out.append((P_QUEST, snap.base, it, need))
     target = _fleet_target(snap, lvl)
-    fleet = len(robots)
+    fleet = _fleet_now()
     if fleet < MIN_FLEET:
         p_st = P_FLEET
-    elif fleet < max(4, target * 0.7):
+    elif fleet < target * 0.92:
         p_st = P_STATION_LOW
     else:
         p_st = P_STATION
     gap = max(0, target - fleet)
+    # Stock for the class we actually intend to build.  A flat cap can sit
+    # BELOW that class's cost (a hauler is 18 ore, the old cap was 14), and
+    # then the station never accumulates enough and the fleet quietly stops
+    # being replaced while robots keep expiring.
+    rcost = ROBOT_COST.get(_pick_robot_type(snap, set(base_unlocks(snap))),
+                           ROBOT_COST["builder"])
     # Only the couple of stations nearest the Base are robot factories; the
     # rest are just charging pads and must not hoard raws.
     prim = sorted(snap.stations,
@@ -777,8 +821,8 @@ def _sinks(snap, want, lvl, cl, me, stock):
         sto = st.storage
         if sto.free <= 0:
             continue
-        for it, per in (("ore", 14), ("metal", 9)):
-            cap = per * min(4, max(1, gap))
+        for it, per in rcost.items():
+            cap = per * min(4, max(2, gap))
             need = min(cap - sto[it], sto.free) - _claimed(cl, me, st.id, it, 5)
             if need > 0:
                 out.append((p_st, st, it, need))
@@ -1091,10 +1135,16 @@ def _status(r, snap, lvl, tick):
     for b in snap.all:
         kinds[b.type] = kinds.get(b.type, 0) + 1
     q = snap.base.quest
-    r.log("L%d t%d robots=%d q=%s/%s stock=%s bld=%s sites=%d"
-          % (lvl, tick, len(robots),
+    worn = [int(b.condition) for b in snap.procs if b.condition is not None]
+    types = {}
+    for x in robots.all():
+        types[x.type] = types.get(x.type, 0) + 1
+    kinds["fleet"] = types
+    r.log("L%d t%d robots=%d/%d q=%s/%s stock=%s bld=%s sites=%d worn=%s unl=%s"
+          % (lvl, tick, len(robots), _fleet_target(snap, lvl),
              (q.progress if q else {}), (q.required if q else {}),
-             st, kinds, len(snap.sites)))
+             st, kinds, len(snap.sites),
+             sorted(worn)[:6], sorted(base_unlocks(snap))))
 
 
 def _act(e):
