@@ -716,6 +716,21 @@ def _plan(snap, wish, spots, lvl, tick):
             continue
         w, h = (2, 2) if t in ("storage", "warehouse") else (1, 1)
         anchor = base_pos
+        # A T1 processor eats raws and emits fewer units than it consumes
+        # (2 metal -> 1 wire), so siting it AT its mine roughly halves the
+        # tonnage that has to cross the map.  T2/T3 run on goods and stay near
+        # the Base, which is where their output is going anyway.
+        item = PRODUCER.get(t)
+        inputs = (CHAIN.get(item) or (None, ()))[1]
+        if item and inputs and all(s in RAWS for s in inputs):
+            src_mines = [m for m in snap.mines
+                         if m.spot and m.spot.resource in inputs
+                         and (m.spot.remaining or 0) > 0]
+            if src_mines:
+                near = min(src_mines,
+                           key=lambda m: _dist(m.position, base_pos))
+                if _dist(near.position, base_pos) > 12:
+                    anchor = near.position
         if t in ("flying_station", "charging_tower") and snap.mines:
             far, fd = None, -1.0
             for m in snap.mines:
